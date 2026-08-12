@@ -64,6 +64,9 @@
     "connectTimeoutMs": 10000
   },
   "listeners": [
+    // HTTP remains raw TCP forwarding: URL/Host/port are not rewritten. The
+    // origin must serve the client's hostname; matching client/origin ports
+    // are recommended. If ports differ, configure the origin accordingly.
     { "name": "internal-http", "type": "http", "listenHost": "127.0.0.1", "listenPort": 18080, "toNodeId": "server-a", "targetHost": "api.example.com", "targetPort": 80 },
     { "name": "dynamic-socks", "type": "socks", "listenHost": "127.0.0.1", "listenPort": 1080, "toNodeId": "server-a" }
   ]
