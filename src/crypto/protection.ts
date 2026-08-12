@@ -1,12 +1,16 @@
+import { resolveSecretValue } from "../config/secrets.ts";
 import type { ProtectionMode } from "../types.ts";
 
 const AEAD_MAGIC = new TextEncoder().encode("TMA1");
 const RC4_MAGIC = new TextEncoder().encode("TMR1");
 
-export function readKeyFromEnv(envName: string | undefined): Uint8Array | undefined {
-  if (!envName) return undefined;
-  const value = process.env[envName];
-  if (!value) throw new Error(`environment variable ${envName} is required`);
+export function readKeyFromEnv(envName: string | undefined, fallback?: string): Uint8Array | undefined {
+  const value = resolveSecretValue(envName, fallback);
+  if (value === undefined) return undefined;
+  return parseKey(value);
+}
+
+function parseKey(value: string): Uint8Array {
   if (value.startsWith("base64:")) return Uint8Array.from(Buffer.from(value.slice(7), "base64"));
   if (value.startsWith("hex:")) return Uint8Array.from(Buffer.from(value.slice(4), "hex"));
   return new TextEncoder().encode(value);

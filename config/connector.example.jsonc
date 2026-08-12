@@ -1,5 +1,6 @@
 // Connector: exposes local fixed routes and a SOCKS5 CONNECT listener.
-// TOM_BATCH_KEY must be supplied in the process environment for aead.
+// TOM_* environment variables override the fallback values below. If an
+// environment variable is absent, its matching configuration value is used.
 {
   "role": "connector",
   "nodeId": "connector-a",
@@ -9,18 +10,23 @@
     "topicPrefix": "$tenant/acme/prod",
     "protocolVersion": 5,
     "qos": 1,
-    "usernameEnv": "MQTT_USERNAME",
-    "passwordEnv": "MQTT_PASSWORD",
+    "username": "replace-with-mqtt-username",
+    "password": "replace-with-mqtt-password",
+    "usernameEnv": "TOM_MQTT_USERNAME",
+    "passwordEnv": "TOM_MQTT_PASSWORD",
     "rejectUnauthorized": true
   },
   "protocols": { "tcp": true, "tls": true, "http": true, "socks": true },
   "batch": {
     "archive": "tgz",
     "protection": "aead",
+    "key": "base64:replace-with-a-high-entropy-secret",
     "keyEnv": "TOM_BATCH_KEY",
-    "maxBatchBytes": 48000,
-    "maxRecordsPerBatch": 64,
-    "maxDelayMs": 2,
+    "maxBatchBytes": 512000,
+    "maxRecordsPerBatch": 128,
+    "maxDelayMs": 50,
+    "minPublishIntervalMs": 5,
+    "maxQueuedRecords": 4096,
     "maxDecompressedBytes": 8388608,
     "maxCompressionRatio": 100
   },

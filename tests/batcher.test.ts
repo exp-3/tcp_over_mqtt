@@ -10,7 +10,7 @@ function config(): AppConfig {
     role: "connector", nodeId: "connector-a",
     mqtt: { url: "mqtt://unused", clientId: "connector-a", topicPrefix: "tenant/test", protocolVersion: 5, qos: 1, rejectUnauthorized: true },
     protocols: { tcp: true, tls: false, http: false, socks: false },
-    batch: { archive: "tgz", protection: "aead", keyEnv: "IGNORED", maxBatchBytes: 48_000, maxRecordsPerBatch: 64, maxDelayMs: 1, maxDecompressedBytes: 1_000_000, maxCompressionRatio: 100 },
+    batch: { archive: "tgz", protection: "aead", keyEnv: "TOM_IGNORED", maxBatchBytes: 48_000, maxRecordsPerBatch: 64, maxDelayMs: 1, minPublishIntervalMs: 0, maxQueuedRecords: 4096, maxDecompressedBytes: 1_000_000, maxCompressionRatio: 100 },
     tunnel: { maxConcurrentTunnels: 10, maxBufferedBytesPerTunnel: 65_536, idleTimeoutMs: 60_000, connectTimeoutMs: 1_000 },
     egress: { allowedHosts: [], allowedPorts: [], denyPrivateNetworks: false },
     http: { allowedHosts: [], allowedPorts: [], denyPrivateNetworks: false, requireHost: true, requireEndpointHostMatch: true, requestHeaderMaxBytes: 4096, requestHeaderTimeoutMs: 1000 },

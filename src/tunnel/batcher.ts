@@ -21,6 +21,8 @@ export class RecordBatcher {
   private flushing: Promise<void> = Promise.resolve();
   private stopped = false;
   private estimatedBytes = 0;
+  private nextPublishAt = 0;
+  private queuedRecords = 0;
 
   public constructor(
     private readonly config: AppConfig,
@@ -30,11 +32,15 @@ export class RecordBatcher {
 
   enqueue(item: OutboundRecord): void {
     if (this.stopped) throw new Error("batcher is stopped");
+    if (this.queuedRecords >= this.config.batch.maxQueuedRecords) {
+      throw new Error(`batch queue is full (${this.config.batch.maxQueuedRecords} records); refusing more outbound data`);
+    }
     const estimated = estimateRecordBytes(item.record);
     if (this.pending.length > 0 && (this.pending.length >= this.config.batch.maxRecordsPerBatch || this.estimatedBytes + estimated > this.config.batch.maxBatchBytes)) {
       void this.flush();
     }
     this.pending.push(item);
+    this.queuedRecords += 1;
     this.estimatedBytes += estimated;
     if (this.pending.length >= this.config.batch.maxRecordsPerBatch || this.estimatedBytes >= this.config.batch.maxBatchBytes) {
       void this.flush();
@@ -48,7 +54,9 @@ export class RecordBatcher {
     if (this.pending.length === 0) return this.flushing;
     const records = this.pending.splice(0);
     this.estimatedBytes = 0;
-    this.flushing = this.flushing.then(() => this.publishGroups(records));
+    this.flushing = this.flushing
+      .then(() => this.publishGroups(records))
+      .finally(() => { this.queuedRecords -= records.length; });
     return this.flushing;
   }
 
@@ -79,7 +87,7 @@ export class RecordBatcher {
     });
     const payload = await this.encode(topic, { id: randomUUID(), records: items.map((item) => item.record) });
     if (payload.byteLength <= this.config.batch.maxBatchBytes) {
-      await this.transport.publish(topic, payload);
+      await this.publishWithRateLimit(topic, payload);
       return;
     }
     if (items.length === 1) {
@@ -88,6 +96,13 @@ export class RecordBatcher {
     const midpoint = Math.ceil(items.length / 2);
     await this.publishSplit(items.slice(0, midpoint));
     await this.publishSplit(items.slice(midpoint));
+  }
+
+  private async publishWithRateLimit(topic: string, payload: Uint8Array): Promise<void> {
+    const waitMs = Math.max(0, this.nextPublishAt - Date.now());
+    if (waitMs > 0) await Bun.sleep(waitMs);
+    this.nextPublishAt = Date.now() + this.config.batch.minPublishIntervalMs;
+    await this.transport.publish(topic, payload);
   }
 
   private async encode(topic: string, batch: TunnelBatch): Promise<Uint8Array> {

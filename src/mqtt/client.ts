@@ -1,4 +1,5 @@
 import { connectAsync, type MqttClient } from "mqtt";
+import { resolveSecretValue } from "../config/secrets.ts";
 import { decodeTarBatch } from "../protocol/archive.ts";
 import { unprotectPayload, readKeyFromEnv } from "../crypto/protection.ts";
 import { buildNodeSubscription, parseBatchTopic } from "../protocol/topic.ts";
@@ -14,22 +15,22 @@ export class MqttBatchNode implements BatchTransport {
   public onError: ((error: Error) => void) | undefined;
 
   public constructor(private readonly config: AppConfig) {
-    this.key = readKeyFromEnv(config.batch.keyEnv);
+    this.key = readKeyFromEnv(config.batch.keyEnv, config.batch.key);
   }
 
   get protectionKey(): Uint8Array | undefined { return this.key; }
 
   async start(): Promise<void> {
-    const username = this.config.mqtt.usernameEnv ? requireEnv(this.config.mqtt.usernameEnv) : undefined;
-    const password = this.config.mqtt.passwordEnv ? requireEnv(this.config.mqtt.passwordEnv) : undefined;
+    const username = resolveSecretValue(this.config.mqtt.usernameEnv, this.config.mqtt.username);
+    const password = resolveSecretValue(this.config.mqtt.passwordEnv, this.config.mqtt.password);
     this.client = await connectAsync(this.config.mqtt.url, {
       clientId: this.config.mqtt.clientId,
       protocolVersion: this.config.mqtt.protocolVersion,
       clean: true,
       reconnectPeriod: 1_000,
       rejectUnauthorized: this.config.mqtt.rejectUnauthorized,
-      ...(username ? { username } : {}),
-      ...(password ? { password } : {}),
+      ...(username !== undefined ? { username } : {}),
+      ...(password !== undefined ? { password } : {}),
     });
     this.client.on("error", (error) => this.onError?.(error));
     this.client.on("message", (topic, payload) => { void this.handleMessage(topic, new Uint8Array(payload)); });
@@ -83,9 +84,4 @@ export class MqttBatchNode implements BatchTransport {
   }
 }
 
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(`environment variable ${name} is required`);
-  return value;
-}
 function asError(error: unknown): Error { return error instanceof Error ? error : new Error(String(error)); }

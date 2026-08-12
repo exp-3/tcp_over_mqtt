@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { parseConfig } from "../src/config/load.ts";
+import { resolveSecretValue } from "../src/config/secrets.ts";
 
-function baseConfig() {
+function baseConfig(): Record<string, any> {
   return {
     role: "server",
     nodeId: "server-a",
@@ -18,6 +19,72 @@ function baseConfig() {
 }
 
 describe("configuration", () => {
+  test("environment secrets override configuration fallbacks", () => {
+    const name = "TOM_TEST_SECRET_OVERRIDE";
+    process.env[name] = "from-environment";
+    try {
+      expect(resolveSecretValue(name, "from-config")).toBe("from-environment");
+    } finally {
+      delete process.env[name];
+    }
+  });
+
+  test("configuration secrets are used when environment variables are absent", () => {
+    const name = "TOM_TEST_SECRET_FALLBACK";
+    delete process.env[name];
+    expect(resolveSecretValue(name, "from-config")).toBe("from-config");
+  });
+
+  test("a configured secret environment variable still fails without a fallback", () => {
+    const name = "TOM_TEST_SECRET_MISSING";
+    delete process.env[name];
+    expect(() => resolveSecretValue(name, undefined)).toThrow(/no configuration fallback/);
+  });
+
+  test("secret environment names use the TOM_ prefix", () => {
+    const raw = baseConfig();
+    raw.mqtt = {
+      url: "mqtt://localhost:1883",
+      topicPrefix: "tenant/test",
+      usernameEnv: "MQTT_USERNAME",
+    };
+    expect(() => parseConfig(raw)).toThrow(/mqtt\.usernameEnv must start with 'TOM_'/);
+  });
+
+  test("secret fallbacks are accepted in configuration", () => {
+    const raw = baseConfig();
+    raw.mqtt = {
+      url: "mqtt://localhost:1883",
+      topicPrefix: "tenant/test",
+      username: "fallback-user",
+      password: "fallback-password",
+      usernameEnv: "TOM_MQTT_USERNAME",
+      passwordEnv: "TOM_MQTT_PASSWORD",
+    };
+    raw.batch = {
+      archive: "tar",
+      protection: "aead",
+      key: "fallback-key",
+      keyEnv: "TOM_BATCH_KEY",
+    };
+    const config = parseConfig(raw);
+    expect(config.mqtt.username).toBe("fallback-user");
+    expect(config.mqtt.password).toBe("fallback-password");
+    expect(config.batch.key).toBe("fallback-key");
+  });
+
+  test("a protected batch may use a configuration key without an environment variable", () => {
+    const raw = baseConfig();
+    raw.batch = { archive: "tar", protection: "aead", key: "fallback-key" };
+    expect(parseConfig(raw).batch.key).toBe("fallback-key");
+  });
+
+  test("batch publish throttling has a safe default", () => {
+    expect(parseConfig(baseConfig()).batch.minPublishIntervalMs).toBe(5);
+    expect(parseConfig(baseConfig()).batch.maxDelayMs).toBe(50);
+    expect(parseConfig(baseConfig()).batch.maxQueuedRecords).toBe(4096);
+  });
+
   test("empty SOCKS allow arrays explicitly mean unrestricted", () => {
     const config = parseConfig(baseConfig());
     expect(config.socks.allowedHosts).toEqual([]);

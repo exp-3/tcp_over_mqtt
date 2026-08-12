@@ -60,6 +60,8 @@ export interface MqttConfig {
   topicPrefix: string;
   protocolVersion: 4 | 5;
   qos: 0 | 1 | 2;
+  username?: string;
+  password?: string;
   usernameEnv?: string;
   passwordEnv?: string;
   rejectUnauthorized: boolean;
@@ -71,8 +73,11 @@ export interface BatchConfig {
   maxBatchBytes: number;
   maxRecordsPerBatch: number;
   maxDelayMs: number;
+  minPublishIntervalMs: number;
+  maxQueuedRecords: number;
   maxDecompressedBytes: number;
   maxCompressionRatio: number;
+  key?: string;
   keyEnv?: string;
 }
 

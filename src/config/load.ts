@@ -72,18 +72,22 @@ export function parseConfig(raw: unknown): AppConfig {
 
 function parseMqtt(raw: unknown, nodeId: string): MqttConfig {
   assertObject(raw, "mqtt");
-  assertNoUnknownKeys(raw, ["url", "clientId", "topicPrefix", "protocolVersion", "qos", "usernameEnv", "passwordEnv", "rejectUnauthorized"], "mqtt");
+  assertNoUnknownKeys(raw, ["url", "clientId", "topicPrefix", "protocolVersion", "qos", "username", "password", "usernameEnv", "passwordEnv", "rejectUnauthorized"], "mqtt");
   const protocolVersion = integerValue(raw.protocolVersion, "mqtt.protocolVersion", { min: 4, max: 5, fallback: 5 });
   if (protocolVersion !== 4 && protocolVersion !== 5) throw new Error("mqtt.protocolVersion must be 4 or 5");
   const qos = integerValue(raw.qos, "mqtt.qos", { min: 0, max: 2, fallback: 1 });
-  const usernameEnv = optionalString(raw.usernameEnv, "mqtt.usernameEnv");
-  const passwordEnv = optionalString(raw.passwordEnv, "mqtt.passwordEnv");
+  const username = optionalString(raw.username, "mqtt.username");
+  const password = optionalString(raw.password, "mqtt.password");
+  const usernameEnv = parseTomEnvName(raw.usernameEnv, "mqtt.usernameEnv");
+  const passwordEnv = parseTomEnvName(raw.passwordEnv, "mqtt.passwordEnv");
   return {
     url: requiredString(raw.url, "mqtt.url"),
     clientId: raw.clientId === undefined ? nodeId : requiredString(raw.clientId, "mqtt.clientId"),
     topicPrefix: validateTopicPrefix(requiredString(raw.topicPrefix, "mqtt.topicPrefix")),
     protocolVersion,
     qos: qos as 0 | 1 | 2,
+    ...(username !== undefined ? { username } : {}),
+    ...(password !== undefined ? { password } : {}),
     ...(usernameEnv ? { usernameEnv } : {}),
     ...(passwordEnv ? { passwordEnv } : {}),
     rejectUnauthorized: booleanValue(raw.rejectUnauthorized, "mqtt.rejectUnauthorized", true),
@@ -103,25 +107,39 @@ function parseProtocols(raw: unknown): ProtocolSwitches {
 
 function parseBatch(raw: unknown): BatchConfig {
   assertObject(raw, "batch");
-  assertNoUnknownKeys(raw, ["archive", "protection", "maxBatchBytes", "maxRecordsPerBatch", "maxDelayMs", "maxDecompressedBytes", "maxCompressionRatio", "keyEnv"], "batch");
+  assertNoUnknownKeys(raw, ["archive", "protection", "maxBatchBytes", "maxRecordsPerBatch", "maxDelayMs", "minPublishIntervalMs", "maxQueuedRecords", "maxDecompressedBytes", "maxCompressionRatio", "key", "keyEnv"], "batch");
   const archive = requiredString(raw.archive, "batch.archive");
   const protection = requiredString(raw.protection, "batch.protection");
   if (archive !== "tar" && archive !== "tgz") throw new Error("batch.archive must be 'tar' or 'tgz'");
   if (protection !== "plain" && protection !== "aead" && protection !== "rc4") {
     throw new Error("batch.protection must be 'plain', 'aead', or 'rc4'");
   }
-  const keyEnv = optionalString(raw.keyEnv, "batch.keyEnv");
-  if (protection !== "plain" && !keyEnv) throw new Error("batch.keyEnv is required for aead or rc4 protection");
+  const key = optionalString(raw.key, "batch.key");
+  const keyEnv = parseTomEnvName(raw.keyEnv, "batch.keyEnv");
+  if (protection !== "plain" && !keyEnv && key === undefined) {
+    throw new Error("batch.keyEnv or batch.key is required for aead or rc4 protection");
+  }
   return {
     archive,
     protection,
     maxBatchBytes: integerValue(raw.maxBatchBytes, "batch.maxBatchBytes", { min: 12_288, max: 16_777_216, fallback: 48_000 }),
     maxRecordsPerBatch: integerValue(raw.maxRecordsPerBatch, "batch.maxRecordsPerBatch", { min: 1, max: 4096, fallback: 64 }),
-    maxDelayMs: integerValue(raw.maxDelayMs, "batch.maxDelayMs", { min: 0, max: 60_000, fallback: 2 }),
+    maxDelayMs: integerValue(raw.maxDelayMs, "batch.maxDelayMs", { min: 1, max: 60_000, fallback: 50 }),
+    minPublishIntervalMs: integerValue(raw.minPublishIntervalMs, "batch.minPublishIntervalMs", { min: 0, max: 60_000, fallback: 5 }),
+    maxQueuedRecords: integerValue(raw.maxQueuedRecords, "batch.maxQueuedRecords", { min: 1, max: 1_000_000, fallback: 4096 }),
     maxDecompressedBytes: integerValue(raw.maxDecompressedBytes, "batch.maxDecompressedBytes", { min: 4096, max: 268_435_456, fallback: 8_388_608 }),
     maxCompressionRatio: integerValue(raw.maxCompressionRatio, "batch.maxCompressionRatio", { min: 1, max: 10_000, fallback: 100 }),
+    ...(key !== undefined ? { key } : {}),
     ...(keyEnv ? { keyEnv } : {}),
   };
+}
+
+function parseTomEnvName(value: unknown, path: string): string | undefined {
+  const name = optionalString(value, path);
+  if (name !== undefined && !name.startsWith("TOM_")) {
+    throw new Error(`${path} must start with 'TOM_'`);
+  }
+  return name;
 }
 
 function parseTunnel(raw: unknown): TunnelConfig {
