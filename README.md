@@ -4,6 +4,75 @@
 
 > This is a security-sensitive proxy/tunnelling program. Use it only on systems and networks you are authorized to operate. Prefer MQTTS, broker ACLs, `aead`, narrowly scoped host/port rules, and `denyPrivateNetworks: true` where appropriate.
 
+## Configuration and run
+
+Configuration uses strict JSONC rather than YAML. Start from the paired examples:
+
+```bash
+cp config/connector.example.jsonc connector.jsonc
+cp config/server.example.jsonc server.jsonc
+export MQTT_USERNAME='...'
+export MQTT_PASSWORD='...'
+export TOM_BATCH_KEY='base64:replace-with-a-high-entropy-secret'
+
+bun run src/cli.ts --config connector.jsonc
+bun run src/cli.ts --config server.jsonc
+```
+
+`TOM_BATCH_KEY` accepts raw text, `base64:<value>`, or `hex:<value>`. `aead` derives an AES-256-GCM key with SHA-256 and authenticates the entire MQTT topic as AAD. `rc4` is intentionally retained only for compatibility and **does not authenticate data**.
+
+Every `protocols` switch (`tcp`, `tls`, `http`, `socks`) must be explicit. When an enabled policy exposes `allowedHosts`/`allowedPorts`, both arrays must be present. `[]` means unrestricted for that dimension; omitting the field is a startup error. The generic `egress` arrays are also explicit.
+
+## Build a standalone executable
+
+Use the included build script to compile the application and its runtime dependencies into one executable for the current platform:
+
+```bash
+bun run build
+```
+
+The output is written to:
+
+```text
+dist/tcp_over_mqtt
+```
+
+Run it with an external JSONC configuration and environment-provided secrets:
+
+```bash
+export MQTT_USERNAME='...'
+export MQTT_PASSWORD='...'
+export TOM_BATCH_KEY='base64:replace-with-a-high-entropy-secret'
+
+./dist/tcp_over_mqtt --config connector.jsonc
+```
+
+The resulting executable does not require Bun or `node_modules` on the target machine. The build script deliberately disables automatic `.env` and `bunfig.toml` loading for the standalone executable; provide credentials through the service environment or a secret manager.
+
+Cross-compilation scripts are also available:
+
+```bash
+bun run build:linux-x64
+bun run build:linux-arm64
+bun run build:windows-x64
+```
+
+They produce:
+
+```text
+dist/tcp_over_mqtt-linux-x64
+dist/tcp_over_mqtt-linux-arm64
+dist/tcp_over_mqtt-windows-x64.exe
+```
+
+Cross-compilation may download the matching Bun runtime. Clean all build output with:
+
+```bash
+bun run clean
+```
+
+Do not embed MQTT credentials or encryption keys into an executable. The `dist/` directory is ignored by Git.
+
 ## Topic format
 
 ```text
@@ -60,30 +129,10 @@ Other optional per-record files are `flags`, `error-code`, `error-message`, and 
 
 An existing external SOCKS proxy is simply a fixed `tcp` target. `https` and `wss` use `tls`; they are not terminated or decrypted.
 
-## Configuration and run
-
-Configuration uses strict JSONC rather than YAML. Start from the paired examples:
-
-```bash
-cp config/connector.example.jsonc connector.jsonc
-cp config/server.example.jsonc server.jsonc
-export MQTT_USERNAME='...'
-export MQTT_PASSWORD='...'
-export TOM_BATCH_KEY='base64:replace-with-a-high-entropy-secret'
-
-bun run src/cli.ts --config connector.jsonc
-bun run src/cli.ts --config server.jsonc
-```
-
-`TOM_BATCH_KEY` accepts raw text, `base64:<value>`, or `hex:<value>`. `aead` derives an AES-256-GCM key with SHA-256 and authenticates the entire MQTT topic as AAD. `rc4` is intentionally retained only for compatibility and **does not authenticate data**.
-
-Every `protocols` switch (`tcp`, `tls`, `http`, `socks`) must be explicit. When an enabled policy exposes `allowedHosts`/`allowedPorts`, both arrays must be present. `[]` means unrestricted for that dimension; omitting the field is a startup error. The generic `egress` arrays are also explicit.
-
 ## Verify
 
 ```bash
-bun run check
-bun test
+bun run verify
 ```
 
 The unit suite covers topic restrictions, strict config semantics, TAR/TGZ + protection round trips, batching, HTTP/TLS/SOCKS first-flight parsers, and access policy helpers. A live broker integration test is intentionally not bundled; validate against a broker with production ACLs before deployment.

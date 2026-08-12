@@ -37,7 +37,7 @@ async function main(): Promise<void> {
 
 function parseConfigPath(args: string[]): string {
   if (args.length === 2 && args[0] === "--config") return args[1]!;
-  console.error("Usage: bun run src/cli.ts --config <path-to-jsonc>");
+  console.error("Usage: tcp_over_mqtt --config <path-to-jsonc>");
   process.exit(2);
 }
 
