@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { assertEndpointAllowed, authorizeEndpoint } from "../net/access.ts";
-import { assertHttpAuthority, inspectHttpRequest } from "../net/http-inspector.ts";
+import { ChunkedBodyTracker, inspectHttpHead, rewriteRequestHead, defaultOriginRequestHost, type HttpMessageInfo } from "../net/http-proxy.ts";
 import { parseSocksConnect, parseSocksGreeting, socksReply } from "../net/socks5.ts";
 import { assertTlsIdentity, inspectTlsClientHello } from "../net/tls-client-hello.ts";
 import { formatEndpoint, parseEndpoint, type Endpoint } from "../protocol/endpoint.ts";
@@ -35,6 +35,14 @@ interface TunnelState {
   socketEnded: boolean;
   remoteEnded: boolean;
   socksLocal: boolean;
+  httpOriginProtocol?: "http" | "https";
+  httpResponseBuffer: Uint8Array;
+  httpResponseBodyRemaining?: number;
+  httpResponseBodyStreaming: boolean;
+  httpResponseChunkedTracker?: ChunkedBodyTracker;
+  httpResponseUpgradePending: boolean;
+  webSocket: boolean;
+  preUpgradeClientData: Uint8Array[];
 }
 
 interface LocalAttachment {
@@ -44,6 +52,11 @@ interface LocalAttachment {
   socksBuffer: Uint8Array;
   socksGreetingDone: boolean;
   closed: boolean;
+  httpBuffer: Uint8Array;
+  httpBodyRemaining?: number;
+  httpBodyStreaming: boolean;
+  httpChunkedTracker?: ChunkedBodyTracker;
+  httpUpgradePending: boolean;
 }
 
 /** Owns local and remote tunnel sockets, sequencing, first-flight policy checks, and egress dialing. */
@@ -57,9 +70,9 @@ export class TunnelManager {
   }
 
   attachLocalSocket(socket: RelaySocket, listener: ListenerConfig): void {
-    const attachment: LocalAttachment = { listener, socket, socksBuffer: new Uint8Array(), socksGreetingDone: false, closed: false };
+    const attachment: LocalAttachment = { listener, socket, socksBuffer: new Uint8Array(), socksGreetingDone: false, closed: false, httpBuffer: new Uint8Array(), httpBodyStreaming: false, httpUpgradePending: false };
     this.attachments.set(socket, attachment);
-    if (listener.type !== "socks") {
+    if (listener.type !== "socks" && listener.type !== "http") {
       const endpoint = { host: listener.targetHost!, port: listener.targetPort! };
       attachment.state = this.createLocalTunnel(socket, listener, endpoint, new Uint8Array());
     }
@@ -69,6 +82,10 @@ export class TunnelManager {
     const attachment = this.attachments.get(socket);
     if (!attachment || attachment.closed) return;
     try {
+      if (attachment.listener.type === "http") {
+        this.consumeHttpClient(attachment, chunk);
+        return;
+      }
       if (attachment.state) {
         this.sendData(attachment.state, chunk);
         return;
@@ -126,7 +143,7 @@ export class TunnelManager {
     this.attachments.clear();
   }
 
-  private createLocalTunnel(socket: RelaySocket, listener: ListenerConfig, endpoint: Endpoint, initialData: Uint8Array): TunnelState {
+  private createLocalTunnel(socket: RelaySocket, listener: ListenerConfig, endpoint: Endpoint, initialData: Uint8Array, openFlags?: string[]): TunnelState {
     const tunnelId = randomUUID();
     const state: TunnelState = {
       key: tunnelKey(listener.toNodeId, tunnelId),
@@ -148,6 +165,12 @@ export class TunnelManager {
       socketEnded: false,
       remoteEnded: false,
       socksLocal: listener.type === "socks",
+      ...(listener.type === "http" ? { httpOriginProtocol: listener.originProtocol! } : {}),
+      httpResponseBuffer: new Uint8Array(),
+      httpResponseBodyStreaming: false,
+      httpResponseUpgradePending: false,
+      webSocket: false,
+      preUpgradeClientData: [],
     };
     this.tunnels.set(state.key, state);
     this.touch(state);
@@ -156,10 +179,159 @@ export class TunnelManager {
     this.batcher.enqueue({
       direction: state.outgoingDirection,
       toNodeId: state.peerNodeId,
-      record: { tunnelId, sequence: 0n, type: "OPEN", protocol: state.protocol, endpoint: formatEndpoint(endpoint), ...(inlineData ? { data: inlineData } : {}) },
+      record: { tunnelId, sequence: 0n, type: "OPEN", protocol: state.protocol, endpoint: formatEndpoint(endpoint), ...(openFlags?.length ? { flags: openFlags } : {}), ...(inlineData ? { data: inlineData } : {}) },
     });
     if (initialData.byteLength > (inlineData?.byteLength ?? 0)) this.sendData(state, initialData);
     return state;
+  }
+
+  private consumeHttpClient(attachment: LocalAttachment, data: Uint8Array): void {
+    const listener = attachment.listener;
+    if (attachment.state?.webSocket) { this.sendData(attachment.state, data); return; }
+    if (attachment.httpUpgradePending) {
+      attachment.httpBuffer = concat([attachment.httpBuffer, data]);
+      this.assertHttpBufferLimit(attachment.httpBuffer.byteLength);
+      return;
+    }
+    attachment.httpBuffer = concat([attachment.httpBuffer, data]);
+    this.assertHttpBufferLimit(attachment.httpBuffer.byteLength);
+    while (attachment.httpBuffer.byteLength > 0) {
+      if (attachment.httpBodyRemaining !== undefined) {
+        if (attachment.httpBodyStreaming) {
+          const available = Math.min(attachment.httpBuffer.byteLength, attachment.httpBodyRemaining);
+          if (!available) return;
+          const body = attachment.httpBuffer.slice(0, available);
+          attachment.httpBuffer = attachment.httpBuffer.slice(available);
+          attachment.httpBodyRemaining -= available;
+          this.sendData(attachment.state!, body);
+          if (attachment.httpBodyRemaining === 0) { delete attachment.httpBodyRemaining; attachment.httpBodyStreaming = false; }
+          continue;
+        }
+        if (attachment.httpBuffer.byteLength < attachment.httpBodyRemaining) return;
+        const body = attachment.httpBuffer.slice(0, attachment.httpBodyRemaining);
+        attachment.httpBuffer = attachment.httpBuffer.slice(attachment.httpBodyRemaining);
+        delete attachment.httpBodyRemaining;
+        this.sendData(attachment.state!, body);
+        continue;
+      }
+      if (attachment.httpChunkedTracker) {
+        const tracked = attachment.httpChunkedTracker.consume(attachment.httpBuffer);
+        if (tracked.consumed) this.sendData(attachment.state!, attachment.httpBuffer.slice(0, tracked.consumed));
+        attachment.httpBuffer = attachment.httpBuffer.slice(tracked.consumed);
+        if (!tracked.complete) return;
+        delete attachment.httpChunkedTracker;
+        continue;
+      }
+      const inspected = inspectHttpHead(attachment.httpBuffer, this.config.http.requestHeaderMaxBytes, "request");
+      if (inspected.status === "incomplete") return;
+      const info = inspected.info;
+      if (info.upgradeWebSocket === false && hasUnsupportedUpgrade(info)) throw new Error("HTTP Upgrade is not supported (only websocket is allowed)");
+      const originRequestHost = listener.originRequestHost ?? defaultOriginRequestHost(listener.originHost!, listener.originPort!, listener.originProtocol!);
+      const rewritten = rewriteRequestHead(info, originRequestHost);
+      const rest = attachment.httpBuffer.slice(info.headerBytes);
+      attachment.httpBuffer = new Uint8Array();
+      if (!attachment.state) {
+        attachment.state = this.createLocalTunnel(attachment.socket, listener, { host: listener.originHost!, port: listener.originPort! }, rewritten, [`http-origin:${listener.originProtocol}`]);
+      } else {
+        this.sendData(attachment.state, rewritten);
+      }
+      if (info.upgradeWebSocket) {
+        attachment.httpUpgradePending = true;
+        attachment.httpBuffer = rest;
+        this.assertHttpBufferLimit(rest.byteLength);
+        return;
+      }
+      if (info.bodyKind === "content-length") {
+        attachment.httpBodyRemaining = info.contentLength!;
+        attachment.httpBodyStreaming = info.contentLength! > maxDataBytesPerRecord(this.config) || info.contentLength! > this.config.tunnel.maxBufferedBytesPerTunnel;
+        attachment.httpBuffer = rest;
+        continue;
+      }
+      if (info.bodyKind === "chunked") {
+        attachment.httpBuffer = rest;
+        attachment.httpChunkedTracker = new ChunkedBodyTracker();
+        continue;
+      }
+      attachment.httpBuffer = rest;
+    }
+  }
+
+  private assertHttpBufferLimit(bytes: number): void {
+    if (bytes > this.config.tunnel.maxBufferedBytesPerTunnel) throw new Error("HTTP message buffering exceeds tunnel.maxBufferedBytesPerTunnel");
+  }
+
+  private observeHttpResponse(state: TunnelState, data: Uint8Array): void {
+    const attachment = state.socket ? this.attachments.get(state.socket) : undefined;
+    if (!attachment?.httpUpgradePending) return;
+    state.httpResponseBuffer = concat([state.httpResponseBuffer, data]);
+    this.assertHttpBufferLimit(state.httpResponseBuffer.byteLength);
+    const inspected = inspectHttpHead(state.httpResponseBuffer, this.config.http.responseHeaderMaxBytes, "response");
+    if (inspected.status === "incomplete") return;
+    attachment.httpUpgradePending = false;
+    if (inspected.info.startLine.split(" ")[1] === "101" && inspected.info.upgradeWebSocket) {
+      state.webSocket = true;
+      const buffered = attachment.httpBuffer;
+      attachment.httpBuffer = new Uint8Array();
+      if (buffered.byteLength) this.sendData(state, buffered);
+    }
+    state.httpResponseBuffer = new Uint8Array();
+  }
+
+  private sendHttpResponse(state: TunnelState, data: Uint8Array): void {
+    state.httpResponseBuffer = concat([state.httpResponseBuffer, data]);
+    this.assertHttpBufferLimit(state.httpResponseBuffer.byteLength);
+    while (state.httpResponseBuffer.byteLength > 0) {
+      if (state.httpResponseBodyRemaining !== undefined) {
+        if (state.httpResponseBodyStreaming) {
+          const available = Math.min(state.httpResponseBuffer.byteLength, state.httpResponseBodyRemaining);
+          if (!available) return;
+          const body = state.httpResponseBuffer.slice(0, available);
+          state.httpResponseBuffer = state.httpResponseBuffer.slice(available);
+          state.httpResponseBodyRemaining -= available;
+          this.sendData(state, body);
+          if (state.httpResponseBodyRemaining === 0) { delete state.httpResponseBodyRemaining; state.httpResponseBodyStreaming = false; }
+          continue;
+        }
+        if (state.httpResponseBuffer.byteLength < state.httpResponseBodyRemaining) return;
+        const body = state.httpResponseBuffer.slice(0, state.httpResponseBodyRemaining);
+        state.httpResponseBuffer = state.httpResponseBuffer.slice(state.httpResponseBodyRemaining);
+        delete state.httpResponseBodyRemaining;
+        this.sendData(state, body);
+        continue;
+      }
+      if (state.httpResponseChunkedTracker) {
+        const tracked = state.httpResponseChunkedTracker.consume(state.httpResponseBuffer);
+        if (tracked.consumed) this.sendData(state, state.httpResponseBuffer.slice(0, tracked.consumed));
+        state.httpResponseBuffer = state.httpResponseBuffer.slice(tracked.consumed);
+        if (!tracked.complete) return;
+        delete state.httpResponseChunkedTracker;
+        continue;
+      }
+      const inspected = inspectHttpHead(state.httpResponseBuffer, this.config.http.responseHeaderMaxBytes, "response");
+      if (inspected.status === "incomplete") return;
+      const info = inspected.info;
+      const head = state.httpResponseBuffer.slice(0, info.headerBytes);
+      state.httpResponseBuffer = state.httpResponseBuffer.slice(info.headerBytes);
+      this.sendData(state, head);
+      if (info.upgradeWebSocket && info.startLine.split(" ")[1] === "101") {
+        state.webSocket = true;
+        if (state.httpResponseBuffer.byteLength) { const rest = state.httpResponseBuffer; state.httpResponseBuffer = new Uint8Array(); this.sendData(state, rest); }
+        return;
+      }
+      if (info.bodyKind === "content-length") {
+        state.httpResponseBodyRemaining = info.contentLength!;
+        state.httpResponseBodyStreaming = info.contentLength! > maxDataBytesPerRecord(this.config) || info.contentLength! > this.config.tunnel.maxBufferedBytesPerTunnel;
+        continue;
+      }
+      if (info.bodyKind === "chunked") {
+        state.httpResponseChunkedTracker = new ChunkedBodyTracker();
+        continue;
+      }
+      if (info.bodyKind === "close") {
+        if (state.httpResponseBuffer.byteLength) { const rest = state.httpResponseBuffer; state.httpResponseBuffer = new Uint8Array(); this.sendData(state, rest); }
+        return;
+      }
+    }
   }
 
   private consumeSocks(attachment: LocalAttachment, data: Uint8Array): void {
@@ -203,7 +375,10 @@ export class TunnelManager {
     }
     if (!this.acceptSequence(state, record)) return;
     if (record.type === "DATA") {
-      if (record.data?.byteLength) this.receivePayload(state, record.data);
+      if (record.data?.byteLength) {
+        if (state.protocol === "http" && this.config.role === "connector" && !state.webSocket) this.observeHttpResponse(state, record.data);
+        this.receivePayload(state, record.data);
+      }
       return;
     }
     if (record.type === "FIN") {
@@ -252,6 +427,12 @@ export class TunnelManager {
       socketEnded: false,
       remoteEnded: false,
       socksLocal: false,
+      ...(record.protocol === "http" ? { httpOriginProtocol: parseHttpOriginProtocol(record.flags) } : {}),
+      httpResponseBuffer: new Uint8Array(),
+      httpResponseBodyStreaming: false,
+      httpResponseUpgradePending: false,
+      webSocket: false,
+      preUpgradeClientData: [],
     };
     this.tunnels.set(key, state);
     this.touch(state);
@@ -271,8 +452,10 @@ export class TunnelManager {
     if (!state.connected) {
       state.inspection.push(data);
       state.inspectionBytes += data.byteLength;
-      const max = state.protocol === "http" ? this.config.http.requestHeaderMaxBytes : state.protocol === "tls" ? this.config.tls.clientHelloMaxBytes : this.config.tunnel.maxBufferedBytesPerTunnel;
-      if (state.inspectionBytes > Math.min(max, this.config.tunnel.maxBufferedBytesPerTunnel)) throw new Error("pre-connect tunnel data exceeds configured limit");
+      // HTTP requests are parsed and constrained at the connector before OPEN. At the
+      // server this buffer can also include a valid request body while the origin dial is pending.
+      const max = state.protocol === "tls" ? this.config.tls.clientHelloMaxBytes : this.config.tunnel.maxBufferedBytesPerTunnel;
+      if (state.inspectionBytes > max) throw new Error("pre-connect tunnel data exceeds configured limit");
       this.startOrInspect(state);
       return;
     }
@@ -294,11 +477,7 @@ export class TunnelManager {
       }
       const initial = concat(state.inspection);
       if (state.protocol === "http") {
-        const inspected = inspectHttpRequest(initial, this.config.http.requestHeaderMaxBytes);
-        if (inspected.status === "incomplete") return this.armInspectionTimeout(state, this.config.http.requestHeaderTimeoutMs);
-        const authority = assertHttpAuthority(inspected.info, state.endpoint, this.config.http);
-        assertEndpointAllowed(state.endpoint, this.config.http, "HTTP endpoint");
-        if (authority) assertEndpointAllowed(authority, this.config.http, "HTTP Host");
+        assertEndpointAllowed(state.endpoint, this.config.http, "HTTP origin");
       } else {
         const inspected = inspectTlsClientHello(initial, this.config.tls.clientHelloMaxBytes);
         if (inspected.status === "incomplete") return this.armInspectionTimeout(state, this.config.tls.clientHelloTimeoutMs);
@@ -339,7 +518,7 @@ export class TunnelManager {
         close: (_socket, error) => { if (error) this.egressError(state, error); },
         error: (_socket, error) => this.egressError(state, error),
         drain: () => this.flushSocket(state),
-      });
+      }, state.protocol === "http" && state.httpOriginProtocol === "https" ? { serverName: state.endpoint.host } : undefined);
       if (!this.tunnels.has(state.key)) { socket.terminate(); return; }
       state.socket = socket;
       state.connecting = false;
@@ -356,7 +535,7 @@ export class TunnelManager {
     }
   }
 
-  private egressData(state: TunnelState, data: Uint8Array): void { this.sendData(state, data); }
+  private egressData(state: TunnelState, data: Uint8Array): void { if (state.protocol === "http" && !state.webSocket) this.sendHttpResponse(state, data); else this.sendData(state, data); }
   private egressEnd(state: TunnelState): void {
     if (!this.tunnels.has(state.key)) return;
     this.sendFin(state);
@@ -449,6 +628,15 @@ function concat(chunks: Uint8Array[]): Uint8Array {
   for (const chunk of chunks) { output.set(chunk, offset); offset += chunk.byteLength; }
   return output;
 }
+function hasUnsupportedUpgrade(info: HttpMessageInfo): boolean {
+  const connection = info.headers.find((header) => header.name.toLowerCase() === "connection")?.value.toLowerCase() ?? "";
+  return connection.split(",").some((value) => value.trim() === "upgrade");
+}
+function parseHttpOriginProtocol(flags: string[] | undefined): "http" | "https" {
+  const values = flags?.filter((flag) => flag.startsWith("http-origin:")) ?? [];
+  if (values.length !== 1 || (values[0] !== "http-origin:http" && values[0] !== "http-origin:https")) throw new Error("HTTP OPEN record requires exactly one valid http-origin flag");
+  return values[0] === "http-origin:https" ? "https" : "http";
+}
 function asError(error: unknown): Error { return error instanceof Error ? error : new Error(String(error)); }
 
 async function connectWithTimeout(
@@ -456,11 +644,12 @@ async function connectWithTimeout(
   port: number,
   timeoutMs: number,
   socket: Bun.SocketHandler<undefined>,
+  tls?: Bun.TLSOptions,
 ): Promise<Bun.Socket<undefined>> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      Bun.connect({ hostname, port, socket, allowHalfOpen: true }),
+      Bun.connect({ hostname, port, socket, allowHalfOpen: true, ...(tls ? { tls } : {}) }),
       new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`connect timed out after ${timeoutMs}ms`)), timeoutMs); }),
     ]);
   } finally {

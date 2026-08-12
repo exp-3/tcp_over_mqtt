@@ -19,6 +19,7 @@ export type RecordType = (typeof RECORD_TYPES)[number];
 export type Direction = "c2s" | "s2c";
 export type ArchiveMode = "tar" | "tgz";
 export type ProtectionMode = "plain" | "aead" | "rc4";
+export type HttpOriginProtocol = "http" | "https";
 
 export interface TunnelRecord {
   tunnelId: string;
@@ -88,10 +89,10 @@ export interface AccessConfig {
 }
 
 export interface HttpConfig extends AccessConfig {
-  requireHost: boolean;
-  requireEndpointHostMatch: boolean;
   requestHeaderMaxBytes: number;
   requestHeaderTimeoutMs: number;
+  responseHeaderMaxBytes: number;
+  responseHeaderTimeoutMs: number;
 }
 
 export interface TlsConfig extends AccessConfig {
@@ -123,6 +124,10 @@ export interface ListenerConfig {
   toNodeId: string;
   targetHost?: string;
   targetPort?: number;
+  originHost?: string;
+  originPort?: number;
+  originProtocol?: HttpOriginProtocol;
+  originRequestHost?: string;
 }
 
 export interface AppConfig {

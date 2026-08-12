@@ -37,14 +37,16 @@
     "connectTimeoutMs": 10000
   },
   "egress": { "allowedHosts": [], "allowedPorts": [], "denyPrivateNetworks": true },
-  // HTTP is raw TCP forwarding and does not rewrite URL/Host/port. Ensure the
-  // target origin serves the client's hostname; matching ports are recommended.
+  // HTTP policy applies to the fixed origin declared by each HTTP listener.
+  // The connector rewrites client requests before the server connects upstream.
   "http": {
     "allowedHosts": ["api.example.com"],
     "allowedPorts": [80, 443],
     "denyPrivateNetworks": true,
-    "requireHost": true,
-    "requireEndpointHostMatch": true
+    "requestHeaderMaxBytes": 65536,
+    "requestHeaderTimeoutMs": 5000,
+    "responseHeaderMaxBytes": 65536,
+    "responseHeaderTimeoutMs": 5000
   },
   "tls": {
     "allowedHosts": ["*.example.com"],

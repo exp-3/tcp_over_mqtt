@@ -1,6 +1,6 @@
 # tcp_over_mqtt
 
-A secure bidirectional TCP-over-MQTT tunnel with batching, AEAD encryption, and TCP, HTTP, TLS, and SOCKS5 forwarding support.
+A secure bidirectional TCP-over-MQTT tunnel with batching, AEAD encryption, TCP/TLS/SOCKS forwarding, and HTTP/1.x reverse-proxy support.
 
 > This is a security-sensitive proxy/tunnelling program. Use it only on systems and networks you are authorized to operate. Prefer MQTTS, broker ACLs, `aead`, narrowly scoped host/port rules, and `denyPrivateNetworks: true` where appropriate.
 
@@ -167,18 +167,33 @@ Other optional per-record files are `flags`, `error-code`, `error-message`, and 
 | --- | --- |
 | `tcp` | Raw stream, no application hostname inspection. |
 | `tls` | Raw TLS/legacy SSL passthrough; parses ClientHello SNI and ECH presence for policy. |
-| `http` | Raw HTTP/1.x stream over the TCP tunnel; only the first request Host/port is parsed for policy. Paths, query, headers and body remain inside the original bytes. |
+| `http` | HTTP/1.x reverse proxy. The connector accepts plaintext HTTP, rewrites the request target and `Host`, and the server connects to a fixed HTTP or HTTPS origin. |
 | `socks` | A local SOCKS5 **CONNECT** listener. The peer performs the actual dynamic outbound connection. SOCKS4, BIND and UDP ASSOCIATE are not implemented. |
 
-> **HTTP forwarding notice:** the current `http` mode still performs raw TCP
-> forwarding. It does not rewrite the request URL, `Host` header, hostname, or
-> port. Ensure the origin server selected by `targetHost`/`targetPort` is
-> configured to serve the same hostname used by the client. Using the same
-> client-facing and origin port is recommended; if the ports differ, configure
-> the origin virtual host and redirects so that the unchanged client request is
-> still accepted.
+> **HTTP reverse-proxy notice:** `http` accepts plaintext HTTP/1.0 and HTTP/1.1 at the connector. Each listener has a fixed `originHost`, `originPort`, and `originProtocol` (`http` or `https`). The origin request `Host` is always rewritten to `originRequestHost`; if omitted, it defaults to the origin host plus a non-default port. HTTPS origins use TLS with SNI set to `originHost` and normal certificate validation. CONNECT, h2c/HTTP2 upgrades, and non-WebSocket upgrades are rejected; WebSocket Upgrade is supported after a `101 Switching Protocols` response.
 
 An existing external SOCKS proxy is simply a fixed `tcp` target. `https` and `wss` use `tls`; they are not terminated or decrypted.
+
+
+## HTTP reverse-proxy listeners
+
+An HTTP listener is not a raw TCP route and uses these fields instead of `targetHost` / `targetPort`:
+
+```jsonc
+{
+  "name": "internal-http",
+  "type": "http",
+  "listenHost": "127.0.0.1",
+  "listenPort": 18080,
+  "toNodeId": "server-a",
+  "originHost": "api.example.com",
+  "originPort": 443,
+  "originProtocol": "https",
+  "originRequestHost": "api.example.com"
+}
+```
+
+HTTP heads continue to use normal ordered `DATA` records; no special TAR `head` file is added. If a request or response supplies a valid `Content-Length`, the implementation buffers it (within `tunnel.maxBufferedBytesPerTunnel`) and prefers a body-only `DATA` record. The batcher uses the actual protected MQTT payload size: if adding the next record would exceed `batch.maxBatchBytes`, it publishes the current batch first and starts a new one. Chunked and close-delimited bodies are streamed in ordinary safely sized `DATA` records.
 
 ## Verify
 

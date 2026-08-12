@@ -11,6 +11,7 @@ import type {
   TlsConfig,
   TunnelConfig,
   TunnelProtocol,
+  HttpOriginProtocol,
 } from "../types.ts";
 import { PROTOCOLS } from "../types.ts";
 import {
@@ -165,7 +166,7 @@ function parseAccess(raw: unknown, path: string, requiredArrays: boolean): Acces
 
 function parseHttp(raw: unknown, enabled: boolean): HttpConfig {
   assertObject(raw, "http");
-  assertNoUnknownKeys(raw, ["allowedHosts", "allowedPorts", "denyPrivateNetworks", "requireHost", "requireEndpointHostMatch", "requestHeaderMaxBytes", "requestHeaderTimeoutMs"], "http");
+  assertNoUnknownKeys(raw, ["allowedHosts", "allowedPorts", "denyPrivateNetworks", "requestHeaderMaxBytes", "requestHeaderTimeoutMs", "responseHeaderMaxBytes", "responseHeaderTimeoutMs"], "http");
   const access = {
     allowedHosts: stringArray(raw.allowedHosts, "http.allowedHosts", enabled),
     allowedPorts: numberArray(raw.allowedPorts, "http.allowedPorts", enabled),
@@ -173,10 +174,10 @@ function parseHttp(raw: unknown, enabled: boolean): HttpConfig {
   };
   return {
     ...access,
-    requireHost: booleanValue(raw.requireHost, "http.requireHost", true),
-    requireEndpointHostMatch: booleanValue(raw.requireEndpointHostMatch, "http.requireEndpointHostMatch", true),
     requestHeaderMaxBytes: integerValue(raw.requestHeaderMaxBytes, "http.requestHeaderMaxBytes", { min: 1024, max: 1_048_576, fallback: 65_536 }),
     requestHeaderTimeoutMs: integerValue(raw.requestHeaderTimeoutMs, "http.requestHeaderTimeoutMs", { min: 100, max: 300_000, fallback: 5_000 }),
+    responseHeaderMaxBytes: integerValue(raw.responseHeaderMaxBytes, "http.responseHeaderMaxBytes", { min: 1024, max: 1_048_576, fallback: 65_536 }),
+    responseHeaderTimeoutMs: integerValue(raw.responseHeaderTimeoutMs, "http.responseHeaderTimeoutMs", { min: 100, max: 300_000, fallback: 5_000 }),
   };
 }
 
@@ -219,7 +220,7 @@ function parseListeners(raw: unknown, protocols: ProtocolSwitches): ListenerConf
   return raw.map((value, index) => {
     const path = `listeners[${index}]`;
     assertObject(value, path);
-    assertNoUnknownKeys(value, ["name", "type", "listenHost", "listenPort", "toNodeId", "targetHost", "targetPort"], path);
+    assertNoUnknownKeys(value, ["name", "type", "listenHost", "listenPort", "toNodeId", "targetHost", "targetPort", "originHost", "originPort", "originProtocol", "originRequestHost"], path);
     const name = requiredString(value.name, `${path}.name`);
     if (names.has(name)) throw new Error(`duplicate listener name '${name}'`);
     names.add(name);
@@ -231,19 +232,43 @@ function parseListeners(raw: unknown, protocols: ProtocolSwitches): ListenerConf
     const address = `${listenHost}:${listenPort}`;
     if (addresses.has(address)) throw new Error(`duplicate listener address '${address}'`);
     addresses.add(address);
-    const targetHost = optionalString(value.targetHost, `${path}.targetHost`);
-    const targetPort = value.targetPort === undefined ? undefined : integerValue(value.targetPort, `${path}.targetPort`, { min: 1, max: 65535 });
-    if (type !== "socks" && (!targetHost || targetPort === undefined)) {
-      throw new Error(`${path} requires targetHost and targetPort for ${type}`);
+    const toNodeId = validateNodeId(requiredString(value.toNodeId, `${path}.toNodeId`), `${path}.toNodeId`);
+
+    if (type === "http") {
+      if (value.targetHost !== undefined || value.targetPort !== undefined) {
+        throw new Error(`${path} HTTP listener uses originHost/originPort instead of targetHost/targetPort`);
+      }
+      const originHost = requiredString(value.originHost, `${path}.originHost`);
+      const originPort = integerValue(value.originPort, `${path}.originPort`, { min: 1, max: 65535 });
+      const originProtocol = requiredString(value.originProtocol, `${path}.originProtocol`) as HttpOriginProtocol;
+      if (originProtocol !== "http" && originProtocol !== "https") throw new Error(`${path}.originProtocol must be 'http' or 'https'`);
+      const originRequestHost = optionalString(value.originRequestHost, `${path}.originRequestHost`);
+      if (originRequestHost !== undefined) validateHttpAuthority(originRequestHost, `${path}.originRequestHost`);
+      return { name, type, listenHost, listenPort, toNodeId, originHost, originPort, originProtocol, ...(originRequestHost !== undefined ? { originRequestHost } : {}) };
     }
-    return {
-      name,
-      type,
-      listenHost,
-      listenPort,
-      toNodeId: validateNodeId(requiredString(value.toNodeId, `${path}.toNodeId`), `${path}.toNodeId`),
-      ...(targetHost ? { targetHost } : {}),
-      ...(targetPort !== undefined ? { targetPort } : {}),
-    };
+
+    if (value.originHost !== undefined || value.originPort !== undefined || value.originProtocol !== undefined || value.originRequestHost !== undefined) {
+      throw new Error(`${path} only HTTP listeners may set originHost/originPort/originProtocol/originRequestHost`);
+    }
+    if (type === "socks") {
+      if (value.targetHost !== undefined || value.targetPort !== undefined) throw new Error(`${path} SOCKS listener must not set targetHost or targetPort`);
+      return { name, type, listenHost, listenPort, toNodeId };
+    }
+    const targetHost = requiredString(value.targetHost, `${path}.targetHost`);
+    const targetPort = integerValue(value.targetPort, `${path}.targetPort`, { min: 1, max: 65535 });
+    return { name, type, listenHost, listenPort, toNodeId, targetHost, targetPort };
   });
+}
+
+function validateHttpAuthority(value: string, path: string): void {
+  if (value.length === 0 || value.length > 512 || /[\s\u0000-\u001f\u007f\/\?#@]/u.test(value)) {
+    throw new Error(`${path} must be a valid HTTP Host authority`);
+  }
+  if (value.startsWith("[")) {
+    if (!/^\[[0-9A-Fa-f:.]+\](?::[1-9][0-9]{0,4})?$/.test(value)) throw new Error(`${path} must be a valid bracketed IPv6 HTTP Host authority`);
+    return;
+  }
+  if (!/^[A-Za-z0-9.-]+(?::[1-9][0-9]{0,4})?$/.test(value)) throw new Error(`${path} must be a valid HTTP Host authority`);
+  const port = value.lastIndexOf(":") < 0 ? undefined : Number(value.slice(value.lastIndexOf(":") + 1));
+  if (port !== undefined && (!Number.isInteger(port) || port > 65535)) throw new Error(`${path} has an invalid port`);
 }

@@ -4,113 +4,81 @@ import { protectPayload } from "../crypto/protection.ts";
 import { buildBatchTopic } from "../protocol/topic.ts";
 import type { AppConfig, Direction, TunnelBatch, TunnelRecord } from "../types.ts";
 
-export interface BatchTransport {
-  publish(topic: string, payload: Uint8Array): Promise<void>;
-}
+export interface BatchTransport { publish(topic: string, payload: Uint8Array): Promise<void>; }
+export interface OutboundRecord { direction: Direction; toNodeId: string; record: TunnelRecord; }
+interface EncodedBatch { topic: string; payload: Uint8Array; }
 
-export interface OutboundRecord {
-  direction: Direction;
-  toNodeId: string;
-  record: TunnelRecord;
-}
-
-/** Batches protocol records into independent TAR/TAR.GZ MQTT payloads. */
+/** Batches ordered protocol records. Actual encoded payload size, not estimates, is the hard boundary. */
 export class RecordBatcher {
   private readonly pending: OutboundRecord[] = [];
   private timer: ReturnType<typeof setTimeout> | undefined;
   private flushing: Promise<void> = Promise.resolve();
   private stopped = false;
-  private estimatedBytes = 0;
   private nextPublishAt = 0;
   private queuedRecords = 0;
 
-  public constructor(
-    private readonly config: AppConfig,
-    private readonly transport: BatchTransport,
-    private readonly key: Uint8Array | undefined,
-  ) {}
+  public constructor(private readonly config: AppConfig, private readonly transport: BatchTransport, private readonly key: Uint8Array | undefined) {}
 
   enqueue(item: OutboundRecord): void {
     if (this.stopped) throw new Error("batcher is stopped");
-    if (this.queuedRecords >= this.config.batch.maxQueuedRecords) {
-      throw new Error(`batch queue is full (${this.config.batch.maxQueuedRecords} records); refusing more outbound data`);
-    }
-    const estimated = estimateRecordBytes(item.record);
-    if (this.pending.length > 0 && (this.pending.length >= this.config.batch.maxRecordsPerBatch || this.estimatedBytes + estimated > this.config.batch.maxBatchBytes)) {
-      void this.flush();
-    }
+    if (this.queuedRecords >= this.config.batch.maxQueuedRecords) throw new Error(`batch queue is full (${this.config.batch.maxQueuedRecords} records); refusing more outbound data`);
     this.pending.push(item);
     this.queuedRecords += 1;
-    this.estimatedBytes += estimated;
-    if (this.pending.length >= this.config.batch.maxRecordsPerBatch || this.estimatedBytes >= this.config.batch.maxBatchBytes) {
-      void this.flush();
-      return;
-    }
+    if (this.pending.length >= this.config.batch.maxRecordsPerBatch) { void this.flush(); return; }
     if (!this.timer) this.timer = setTimeout(() => { void this.flush(); }, this.config.batch.maxDelayMs);
   }
 
   async flush(): Promise<void> {
     if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
-    if (this.pending.length === 0) return this.flushing;
+    if (!this.pending.length) return this.flushing;
     const records = this.pending.splice(0);
-    this.estimatedBytes = 0;
-    this.flushing = this.flushing
-      .then(() => this.publishGroups(records))
-      .finally(() => { this.queuedRecords -= records.length; });
+    this.flushing = this.flushing.then(() => this.publishGroups(records)).finally(() => { this.queuedRecords -= records.length; });
     return this.flushing;
   }
-
-  async close(): Promise<void> {
-    this.stopped = true;
-    await this.flush();
-  }
+  async close(): Promise<void> { this.stopped = true; await this.flush(); }
 
   private async publishGroups(records: OutboundRecord[]): Promise<void> {
     const groups = new Map<string, OutboundRecord[]>();
     for (const item of records) {
       const key = `${item.direction}\u0000${item.toNodeId}`;
-      const group = groups.get(key);
-      if (group) group.push(item); else groups.set(key, [item]);
+      const group = groups.get(key); if (group) group.push(item); else groups.set(key, [item]);
     }
-    for (const group of groups.values()) await this.publishSplit(group);
+    for (const group of groups.values()) await this.publishPacked(group);
   }
 
-  private async publishSplit(items: OutboundRecord[]): Promise<void> {
+  private async publishPacked(items: OutboundRecord[]): Promise<void> {
+    let current: OutboundRecord[] = [];
+    let currentEncoded: EncodedBatch | undefined;
+    for (const item of items) {
+      const candidate = [...current, item];
+      const candidateEncoded = await this.encodeItems(candidate);
+      if (candidate.length <= this.config.batch.maxRecordsPerBatch && candidateEncoded.payload.byteLength <= this.config.batch.maxBatchBytes) {
+        current = candidate;
+        currentEncoded = candidateEncoded;
+        continue;
+      }
+      if (currentEncoded) await this.publishEncoded(currentEncoded);
+      const single = await this.encodeItems([item]);
+      if (single.payload.byteLength > this.config.batch.maxBatchBytes) {
+        throw new Error(`single ${item.record.type} record exceeds batch.maxBatchBytes=${this.config.batch.maxBatchBytes}; reduce tunnel record size`);
+      }
+      current = [item];
+      currentEncoded = single;
+    }
+    if (currentEncoded) await this.publishEncoded(currentEncoded);
+  }
+
+  private async encodeItems(items: OutboundRecord[]): Promise<EncodedBatch> {
     const first = items[0]!;
-    const topic = buildBatchTopic({
-      topicPrefix: this.config.mqtt.topicPrefix,
-      direction: first.direction,
-      toNodeId: first.toNodeId,
-      fromNodeId: this.config.nodeId,
-      archive: this.config.batch.archive,
-      protection: this.config.batch.protection,
-    });
-    const payload = await this.encode(topic, { id: randomUUID(), records: items.map((item) => item.record) });
-    if (payload.byteLength <= this.config.batch.maxBatchBytes) {
-      await this.publishWithRateLimit(topic, payload);
-      return;
-    }
-    if (items.length === 1) {
-      throw new Error(`single ${items[0]!.record.type} record produces ${payload.byteLength} bytes, exceeding batch.maxBatchBytes=${this.config.batch.maxBatchBytes}`);
-    }
-    const midpoint = Math.ceil(items.length / 2);
-    await this.publishSplit(items.slice(0, midpoint));
-    await this.publishSplit(items.slice(midpoint));
+    const topic = buildBatchTopic({ topicPrefix: this.config.mqtt.topicPrefix, direction: first.direction, toNodeId: first.toNodeId, fromNodeId: this.config.nodeId, archive: this.config.batch.archive, protection: this.config.batch.protection });
+    const batch: TunnelBatch = { id: randomUUID(), records: items.map((item) => item.record) };
+    const archive = await encodeTarBatch(batch, this.config.batch.archive === "tgz");
+    return { topic, payload: await protectPayload(this.config.batch.protection, archive, topic, this.key) };
   }
-
-  private async publishWithRateLimit(topic: string, payload: Uint8Array): Promise<void> {
+  private async publishEncoded(encoded: EncodedBatch): Promise<void> {
     const waitMs = Math.max(0, this.nextPublishAt - Date.now());
     if (waitMs > 0) await Bun.sleep(waitMs);
     this.nextPublishAt = Date.now() + this.config.batch.minPublishIntervalMs;
-    await this.transport.publish(topic, payload);
+    await this.transport.publish(encoded.topic, encoded.payload);
   }
-
-  private async encode(topic: string, batch: TunnelBatch): Promise<Uint8Array> {
-    const archive = await encodeTarBatch(batch, this.config.batch.archive === "tgz");
-    return protectPayload(this.config.batch.protection, archive, topic, this.key);
-  }
-}
-
-function estimateRecordBytes(record: TunnelRecord): number {
-  return 1_536 + (record.data?.byteLength ?? 0) + (record.endpoint?.length ?? 0) + (record.errorMessage?.length ?? 0);
 }

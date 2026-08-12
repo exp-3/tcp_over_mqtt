@@ -85,6 +85,28 @@ describe("configuration", () => {
     expect(parseConfig(baseConfig()).batch.maxQueuedRecords).toBe(4096);
   });
 
+  test("HTTP listener requires a fixed origin and rejects legacy TCP target fields", () => {
+    const raw = baseConfig();
+    raw.protocols.http = true;
+    raw.http = { allowedHosts: [], allowedPorts: [] };
+    raw.listeners = [{ name: "http", type: "http", listenHost: "127.0.0.1", listenPort: 18080, toNodeId: "peer-a", originHost: "origin.example", originPort: 443, originProtocol: "https" }];
+    const listener = parseConfig(raw).listeners[0]!;
+    expect(listener.originProtocol).toBe("https");
+    expect(listener.originRequestHost).toBeUndefined();
+    raw.listeners[0].targetHost = "legacy.example";
+    expect(() => parseConfig(raw)).toThrow(/originHost\/originPort/);
+  });
+
+  test("HTTP listener validates an optional originRequestHost", () => {
+    const raw = baseConfig();
+    raw.protocols.http = true;
+    raw.http = { allowedHosts: [], allowedPorts: [] };
+    raw.listeners = [{ name: "http", type: "http", listenHost: "127.0.0.1", listenPort: 18080, toNodeId: "peer-a", originHost: "origin.example", originPort: 8443, originProtocol: "https", originRequestHost: "public.example:8443" }];
+    expect(parseConfig(raw).listeners[0]!.originRequestHost).toBe("public.example:8443");
+    raw.listeners[0].originRequestHost = "bad host/path";
+    expect(() => parseConfig(raw)).toThrow(/originRequestHost/);
+  });
+
   test("empty SOCKS allow arrays explicitly mean unrestricted", () => {
     const config = parseConfig(baseConfig());
     expect(config.socks.allowedHosts).toEqual([]);

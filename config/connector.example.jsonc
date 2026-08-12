@@ -43,8 +43,10 @@
     "allowedHosts": ["api.example.com"],
     "allowedPorts": [80, 443],
     "denyPrivateNetworks": true,
-    "requireHost": true,
-    "requireEndpointHostMatch": true
+    "requestHeaderMaxBytes": 65536,
+    "requestHeaderTimeoutMs": 5000,
+    "responseHeaderMaxBytes": 65536,
+    "responseHeaderTimeoutMs": 5000
   },
   "tls": {
     "allowedHosts": ["*.example.com"],
@@ -64,10 +66,9 @@
     "connectTimeoutMs": 10000
   },
   "listeners": [
-    // HTTP remains raw TCP forwarding: URL/Host/port are not rewritten. The
-    // origin must serve the client's hostname; matching client/origin ports
-    // are recommended. If ports differ, configure the origin accordingly.
-    { "name": "internal-http", "type": "http", "listenHost": "127.0.0.1", "listenPort": 18080, "toNodeId": "server-a", "targetHost": "api.example.com", "targetPort": 80 },
+    // HTTP is a reverse proxy. Client HTTP is accepted locally and forwarded
+    // to the fixed origin; Host is rewritten to originRequestHost (or its default).
+    { "name": "internal-http", "type": "http", "listenHost": "127.0.0.1", "listenPort": 18080, "toNodeId": "server-a", "originHost": "api.example.com", "originPort": 443, "originProtocol": "https", "originRequestHost": "api.example.com" },
     { "name": "dynamic-socks", "type": "socks", "listenHost": "127.0.0.1", "listenPort": 1080, "toNodeId": "server-a" }
   ]
 }

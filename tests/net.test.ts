@@ -83,3 +83,27 @@ function buildClientHello(host: string, ech: boolean): Uint8Array {
   const handshake = Uint8Array.from([1, (body.byteLength >>> 16) & 255, (body.byteLength >>> 8) & 255, body.byteLength & 255, ...body]);
   return Uint8Array.from([22, 3, 1, (handshake.byteLength >>> 8) & 255, handshake.byteLength & 255, ...handshake]);
 }
+
+describe("HTTP reverse-proxy helpers", () => {
+  test("rewrites absolute requests and replaces Host", async () => {
+    const { inspectHttpHead, rewriteRequestHead, defaultOriginRequestHost } = await import("../src/net/http-proxy.ts");
+    const source = new TextEncoder().encode("GET http://client.example/a?q=1 HTTP/1.1\r\nHost: client.example\r\nConnection: keep-alive\r\nX-Test: yes\r\n\r\n");
+    const inspected = inspectHttpHead(source, 4096, "request");
+    expect(inspected.status).toBe("complete");
+    if (inspected.status === "complete") {
+      expect(new TextDecoder().decode(rewriteRequestHead(inspected.info, "origin.example:8443"))).toBe("GET /a?q=1 HTTP/1.1\r\nHost: origin.example:8443\r\nX-Test: yes\r\n\r\n");
+    }
+    expect(defaultOriginRequestHost("origin.example", 443, "https")).toBe("origin.example");
+    expect(defaultOriginRequestHost("origin.example", 8443, "https")).toBe("origin.example:8443");
+    const chunked = inspectHttpHead(new TextEncoder().encode("POST /upload HTTP/1.1\r\nHost: client.example\r\nTransfer-Encoding: chunked\r\n\r\n"), 4096, "request");
+    if (chunked.status === "complete") expect(new TextDecoder().decode(rewriteRequestHead(chunked.info, "origin.example"))).toContain("Transfer-Encoding: chunked\r\n");
+  });
+
+  test("tracks a complete chunked body and leaves following request bytes untouched", async () => {
+    const { ChunkedBodyTracker } = await import("../src/net/http-proxy.ts");
+    const body = new TextEncoder().encode("4\r\ntest\r\n0\r\nX-Trailer: ok\r\n\r\nGET /next");
+    const result = new ChunkedBodyTracker().consume(body);
+    expect(result.complete).toBeTrue();
+    expect(new TextDecoder().decode(body.slice(result.consumed))).toBe("GET /next");
+  });
+});
