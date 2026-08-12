@@ -1,0 +1,57 @@
+# Dependencies
+node_modules/
+
+# Bun generated/cache files
+.bun/
+
+# Build and coverage output
+dist/
+build/
+out/
+coverage/
+*.tsbuildinfo
+
+# Runtime logs and temporary files
+*.log
+logs/
+tmp/
+temp/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+
+# Local configuration copies; keep checked-in examples
+*.local.jsonc
+*.local.json
+config/*.jsonc
+config/*.json
+!config/connector.example.jsonc
+!config/server.example.jsonc
+
+# Editor and OS files
+.vscode/*
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+playwright-report/
+test-results/
+
+# Backup files
+*.bak
+*.tmp
+*~
+
+# Local design notes (not published)
+DESIGN.md

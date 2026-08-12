@@ -1,0 +1,57 @@
+// Server/exitor counterpart. It can also host its own local listeners if desired.
+{
+  "role": "server",
+  "nodeId": "server-a",
+  "mqtt": {
+    "url": "mqtts://broker.example.com:8883",
+    "clientId": "server-a",
+    "topicPrefix": "$tenant/acme/prod",
+    "protocolVersion": 5,
+    "qos": 1,
+    "usernameEnv": "MQTT_USERNAME",
+    "passwordEnv": "MQTT_PASSWORD",
+    "rejectUnauthorized": true
+  },
+  "protocols": { "tcp": true, "tls": true, "http": true, "socks": true },
+  "batch": {
+    "archive": "tgz",
+    "protection": "aead",
+    "keyEnv": "TOM_BATCH_KEY",
+    "maxBatchBytes": 48000,
+    "maxRecordsPerBatch": 64,
+    "maxDelayMs": 2,
+    "maxDecompressedBytes": 8388608,
+    "maxCompressionRatio": 100
+  },
+  "tunnel": {
+    "maxConcurrentTunnels": 1024,
+    "maxBufferedBytesPerTunnel": 1048576,
+    "idleTimeoutMs": 60000,
+    "connectTimeoutMs": 10000
+  },
+  "egress": { "allowedHosts": [], "allowedPorts": [], "denyPrivateNetworks": true },
+  "http": {
+    "allowedHosts": ["api.example.com"],
+    "allowedPorts": [80, 443],
+    "denyPrivateNetworks": true,
+    "requireHost": true,
+    "requireEndpointHostMatch": true
+  },
+  "tls": {
+    "allowedHosts": ["*.example.com"],
+    "allowedPorts": [443],
+    "denyPrivateNetworks": true,
+    "requireSni": true,
+    "requireEndpointSniMatch": true,
+    "allowEch": false,
+    "allowedEchPublicNames": [],
+    "legacySsl": "reject"
+  },
+  "socks": {
+    "allowedHosts": [],
+    "allowedPorts": [],
+    "denyPrivateNetworks": true,
+    "connectTimeoutMs": 10000
+  },
+  "listeners": []
+}
